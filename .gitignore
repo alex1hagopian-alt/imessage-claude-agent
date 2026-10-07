@@ -1,0 +1,26 @@
+# Secrets and personal configuration
+.env
+
+# Logs and runtime state (these contain your messages and addresses)
+*.log
+send_debug.log
+last_thread.json
+AGENT_DISABLED
+/tmp
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Built on each machine by scripts/make_apps.py (they embed your local paths)
+*.app/
+
+# macOS
+.DS_Store
+
+# Claude Code project memory. Written by the bridge at the end of sessions and it
+# holds your phone number, addresses and setup history: publish a sanitized copy
+# if you want one, never this file.
+CLAUDE.md
