@@ -1,3 +1,5 @@
+
+
 # iMessage agent for macOS
 
 A small set of Python scripts that let you control a Mac from an iPhone over iMessage. A background agent reads your texts and can run terminal commands (after you confirm each one), start and stop [Claude Code](https://www.anthropic.com/claude-code) sessions in your project folders, and send you a daily morning brief. Claude Code's permission prompts and results are relayed back to your phone, so you can steer a coding session without sitting at the Mac.
