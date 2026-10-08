@@ -89,7 +89,7 @@ Text the agent's address from your iPhone.
 
 | Say | What happens |
 |---|---|
-| any request, e.g. `show disk usage` | Claude proposes one terminal command; reply `YES` to run it or `NO` to cancel. Riskier commands need `CONFIRM`. |
+| anything else | Chat with Claude: it answers questions, brainstorms, and explains how this system works (it is given this project's documentation and remembers the last 10 messages). If you clearly ask it to *do* something on the Mac, e.g. `show disk usage`, it proposes one terminal command; reply `YES` to run it or `NO` to cancel. Riskier commands need `CONFIRM`. |
 | `start claude <name>` | Open `<PROJECTS_DIR>/<name>` (created if new) in a Claude Code session. The name is normalized (`Trading Bot` becomes `trading-bot`). A path starting with `/` or `~` is used as given. |
 | `start claude` | Asks which project. |
 | `stop claude` | Ends the session. If Claude did work, it first updates the project's `CLAUDE.md` (its memory for next time). |
@@ -110,7 +110,7 @@ During a Claude Code session, permission requests arrive as a menu: reply `1` (y
 
 This tool can run commands on your computer from a text message. It has guards, but they are pattern checks, not a sandbox.
 
-- **Confirmation for every command.** Claude only *proposes* one terminal command per request; nothing runs until you reply `YES`. Any other message cancels a pending proposal, so a late `YES` can't run it.
+- **Confirmation for every command.** Claude only *proposes* a terminal command (through a tool call, never by free text), one per reply; nothing runs until you reply `YES`. Any other message cancels a pending proposal, so a late `YES` can't run it.
 - **Blocklist.** Some commands are refused outright, whatever you reply, and logged to `blocked.log` with a timestamp: `rm -rf` and recursive `rm` on absolute paths, `sudo rm`, `mkfs`/`diskutil erase`, `dd if=`, `format`, `kill -9`, `chmod -R 777`, `chown -R`, writing to devices (`> /dev/...`), piping anything into a shell (`| sh`, `| bash`), `curl | bash` style remote execution, and fork bombs. The check normalizes quoting and flag order, and runs again immediately before execution. It can be bypassed indirectly (for example `find / -delete`), and it does not cover Claude Code's own tool use, which relies on the per-request permission prompts.
 - **Elevated confirmation.** Commands using `sudo`, `rm`, `>` to overwrite a file, `pip`/`npm install`, or touching `~/.ssh`, `~/.aws` or any `.env` file require the exact word `CONFIRM` (YES is not enough).
 - **Kill switch.** The `Stop AI Agent` app (from `scripts/make_apps.py`) creates the `AGENT_DISABLED` flag, unloads the launchd jobs, and kills the agent, any Claude Code session and the morning brief. `Start AI Agent` removes the flag and starts it again.
@@ -135,5 +135,6 @@ Debugging: `agent.log` and `agent_error.log` (the agent), `bridge.log` (Claude C
 
 - macOS only; it depends on the Messages database layout and AppleScript, which Apple can change.
 - Messages in iMessage groups are not supported.
-- If the API key runs out of credit, free-text commands and Claude Code sessions fail; local commands like `status` and `restart agent` keep working.
+- If the API key runs out of credit, chat and Claude Code sessions fail (the agent tells you why); local commands like `status` and `restart agent` keep working.
+- Chat is billed to your API key: each message sends the project documentation (about 8k tokens, cached for 5 minutes) plus the last 10 messages.
 - Anyone who controls your iPhone or your Apple ID can control this agent. Treat access to the agent's conversation like access to a terminal on the Mac.

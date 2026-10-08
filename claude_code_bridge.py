@@ -18,6 +18,7 @@ import datetime
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -46,6 +47,30 @@ MEMORY_PROMPT = ("Update CLAUDE.md in this project folder to reflect everything 
                  "for future sessions.")
 MEMORY_TIMEOUT = 240       # seconds Claude gets to write CLAUDE.md
 INTERRUPT_TIMEOUT = 20     # seconds to abort a task that is mid-flight
+
+# Appended to Claude Code's system prompt for every bridge session.
+BRIDGE_SYSTEM_PROMPT = ("You are being accessed via iMessage from an iPhone through an "
+                        "automated bridge. The user cannot use keyboard shortcuts like "
+                        "Ctrl+D, /exit, or Ctrl+C. Never suggest terminal-only solutions "
+                        "or keyboard shortcuts. All interaction happens through text "
+                        "messages on a phone.")
+
+# Makes Claude fill in the Bash tool's `description` field, which the permission
+# menu shows under each command for beginners.
+COMMAND_EXPLAIN_PROMPT = ("Every time you call the Bash tool, always set its description "
+                          "to one or two short plain-English sentences explaining what the "
+                          "command does, written for a complete beginner. Do this for every "
+                          "command, even simple ones like ls or pip install.")
+NO_EXPLANATION = "(No plain-English explanation was provided for this command.)"
+
+# A result saying one of these means the turn accomplished nothing worth remembering.
+NOTHING_DONE_RE = re.compile(
+    r"nothing\s+(?:was|has\s+been)\s+(?:changed|done|modified)|nothing\s+worth\s+saving"
+    r"|no\s+changes\s+(?:were|have\s+been)\s+made", re.IGNORECASE)
+# Terminal-only advice that is useless over iMessage; it means Claude is telling the user to quit.
+TERMINAL_ONLY_RE = re.compile(
+    r"\bctrl\s*[-+]\s*[cd]\b|\bcontrol\s*[-+]\s*[cd]\b|(?<![\w/.~-])/(?:exit|quit)\b(?![\w./-])",
+    re.IGNORECASE)
 
 NEW_PROJECT_PROMPT = ("This is a new project called {name}. "
                       "Wait for the user to describe what they want to build.")
@@ -121,7 +146,9 @@ def clip(text, limit=300):  # short previews only (tool descriptions); never use
 def describe_tool_request(tool, tool_input):
     """One compact, human-readable line (or block) for a permission prompt."""
     if tool == 'Bash':
-        return f"Bash:\n{tool_input.get('command', '')}"
+        explanation = ' '.join(str(tool_input.get('description') or '').split())
+        return (f"Bash:\n{tool_input.get('command', '')}"
+                f"\n\nWhat this does: {explanation or NO_EXPLANATION}")
     if tool in ('Write', 'Edit', 'MultiEdit', 'NotebookEdit'):
         path = tool_input.get('file_path') or tool_input.get('notebook_path', '')
         preview = tool_input.get('content') or tool_input.get('new_string') or ''
@@ -161,6 +188,7 @@ class Bridge:
         self.turn_active = False   # a message was sent and no result seen yet
         self.did_work = False      # at least one real task was sent
         self.ack_pending = False   # tell the user Claude Code picked the task up
+        self.all_idle = True       # every result so far said nothing was done/changed
         # For the agent's "status" command; main() turns this on
         self.state_file = None
         self.started_at = time.time()
@@ -251,7 +279,9 @@ class Bridge:
                '--input-format', 'stream-json',
                '--output-format', 'stream-json', '--verbose',
                '--permission-mode', self.permission_mode,
-               '--permission-prompt-tool', 'stdio']
+               '--permission-prompt-tool', 'stdio',
+               '--append-system-prompt',
+               BRIDGE_SYSTEM_PROMPT + ' ' + COMMAND_EXPLAIN_PROMPT]
         if self.model:
             cmd += ['--model', self.model]
         self.proc = subprocess.Popen(
@@ -405,9 +435,15 @@ class Bridge:
                 return event
         return None
 
+    def note_result(self, result):
+        """Track whether the session has accomplished anything worth remembering."""
+        text = result.get('result') or ''
+        if result.get('is_error') or not NOTHING_DONE_RE.search(text):
+            self.all_idle = False
+
     def update_memory(self):
         """Ask Claude Code to refresh CLAUDE.md before the session closes."""
-        if not self.did_work or self.proc is None or self.proc.poll() is not None:
+        if not self.did_work or self.all_idle or self.proc is None or self.proc.poll() is not None:
             return
         claude_md = os.path.join(self.project_dir, 'CLAUDE.md')
         mtime = lambda: os.path.getmtime(claude_md) if os.path.exists(claude_md) else None
@@ -482,6 +518,14 @@ class Bridge:
                 self.handle_control_request(event)
             elif kind == 'result':
                 self.turn_active = False
+                text = event.get('result') or ''
+                if TERMINAL_ONLY_RE.search(text):
+                    # Claude is telling the user to quit from a terminal, which
+                    # they can't do from a phone: close instead of forwarding it.
+                    log(f"terminal-only instructions in result; closing: {one_line(text, 200)}")
+                    self.update_memory()
+                    return self.notify("Session ended.")
+                self.note_result(event)
                 if self.preamble_pending and not event.get('is_error'):
                     self.preamble_pending = False
                     task = first_task or self.prompt_for_task()

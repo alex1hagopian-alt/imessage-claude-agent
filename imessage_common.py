@@ -226,7 +226,12 @@ end tell'''
             pass
 
 
-def send_imessage(text):
+# Callables run once per send_imessage() call with the full (unsplit) text, after it is sent.
+# The agent registers one to keep its conversation history; the bridge registers none.
+SEND_HOOKS = []
+
+
+def send_imessage(text, hooks=True):
     """Text `text` to the user, splitting and labelling it if it is long."""
     chunks = split_message(text)
     identifier, why = reply_target()  # decided once, so all parts go to the same thread
@@ -236,3 +241,9 @@ def send_imessage(text):
         # Record before sending so the echo is recognised even if it lands fast
         SENT_TEXTS.append(normalize(chunk))
         _send_one(chunk, identifier, why)
+    if hooks:
+        for hook in SEND_HOOKS:
+            try:
+                hook(text)
+            except Exception:
+                pass  # a bookkeeping hook must never break sending
