@@ -14,9 +14,10 @@ import anthropic
 
 import config
 import imessage_common
-from imessage_common import (AGENT_ADDRESS, REPLY_ADDRESS, REPLY_CHAT_GUID, SENT_TEXTS, WATCH_IDENTIFIERS,
-                              is_part_label, normalize, reply_target, send_imessage,
-                              set_reply_target, truncate_output)
+from imessage_common import (AGENT_ADDRESS, COLLABORATOR, OWNER, PEOPLE, REPLY_ADDRESS, REPLY_CHAT_GUID,
+                              SENT_TEXTS, WATCH_IDENTIFIERS, is_part_label, normalize, person_for,
+                              project_holder, reply_target, send_imessage, set_reply_target,
+                              truncate_output)
 
 client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY or None, timeout=60)
 
@@ -27,10 +28,28 @@ CHAT_DB = config.CHAT_DB
 CHAT_IDENTIFIERS = WATCH_IDENTIFIERS
 # Written by morning_brief.py right before it sends the brief
 BRIEF_TEXT_FILE = '/tmp/brief_text.txt'
-# Present while claude_code_bridge.py owns the chat; this agent stays quiet
+# Present while a claude_code_bridge.py session owns that person's chat; this agent
+# stays quiet for them. The user's files have these names; the collaborator's get a
+# "_collaborator" suffix (see bridge_lock_file / bridge_state_file).
 BRIDGE_LOCK_FILE = '/tmp/claude_bridge.lock'
 # Written by the bridge (pid, project, start time, last text it sent) for "status"
 BRIDGE_STATE_FILE = '/tmp/claude_bridge_state.json'
+
+
+def _per_person(path, person):
+    if person == COLLABORATOR:
+        root, ext = os.path.splitext(path)
+        return f'{root}_{COLLABORATOR}{ext}'
+    return path
+
+
+def bridge_lock_file(person=OWNER):
+    return _per_person(BRIDGE_LOCK_FILE, person)
+
+
+def bridge_state_file(person=OWNER):
+    return _per_person(BRIDGE_STATE_FILE, person)
+
 AGENT_STARTED = time.time()
 POLL_SECONDS = 2
 # Messages sync in from iCloud with old dates but new rowids, so rowid alone
@@ -42,6 +61,7 @@ STARTUP_DATE_NS = int((time.time() - 978307200) * 1_000_000_000)
 AUTOMATED_PREFIXES = ('[claude code ·', "i'd like to run:", 'running: ',
                       'done. output:', 'agent online', 'got it — cancelled',
                       'claude code is already running', 'starting claude code',
+                      'the other user is already', 'claude code wasn', 'sorry, only the owner',
                       'claude code session ended', 'no active claude code session',
                       'not a directory:', 'created new project:',
                       'projects in ', 'no projects yet',
@@ -102,14 +122,29 @@ MAX_MEMORY_CHARS = 20000   # sanity cap only; longer files are sent as several p
 # "stop claude": how long the bridge gets to update CLAUDE.md and exit on its
 # own before we fall back to SIGTERM/SIGKILL
 STOP_GRACE_SECONDS = 360
-BRIDGE_PROC = None  # Popen handle when this agent launched the bridge
 # How many polls to wait for a row's body to be written before skipping it
 MAX_EMPTY_POLLS = 5
 
-PENDING_ACTION = {}
-# Set when "start claude" arrives with no project: the next message is the name
-PENDING_PROJECT_UNTIL = 0.0
 PROJECT_REPLY_TIMEOUT = 5 * 60
+
+
+class PersonState:
+    """Everything the agent remembers about ONE person (the user or the collaborator), so
+    their conversations, YES/NO prompts and Claude Code sessions never mix."""
+
+    def __init__(self):
+        self.bridge_proc = None            # Popen handle when this agent launched their bridge
+        self.pending_action = {}           # a proposed terminal command awaiting YES/CONFIRM
+        self.pending_project_until = 0.0   # set when "start claude" had no project: next message is the name
+        self.conversation = deque(maxlen=HISTORY_MESSAGES)  # in memory only
+
+
+STATES = {}
+CURRENT_PERSON = OWNER  # who the message being handled came from (the agent handles one at a time)
+
+
+def state():
+    return STATES.setdefault(CURRENT_PERSON, PersonState())
 # SENT_TEXTS (what this process has sent, for echo filtering) lives in imessage_common.
 
 ASSISTANT_MODEL = "claude-sonnet-4-6"
@@ -180,7 +215,16 @@ def build_system():
         name, text = knowledge
         blocks.append({"type": "text", "cache_control": {"type": "ephemeral"},
                        "text": f"REFERENCE: the contents of {name}, the documentation of this system.\n\n{text}"})
-    blocks.append({"type": "text", "text": "Current date and time: "
+    if CURRENT_PERSON == OWNER:
+        who = ("The person texting you right now is the OWNER, the person who set up and runs this system "
+               "(called \"the user\" in the reference).")
+    else:
+        who = ("The person texting you right now is the COLLABORATOR, a trusted second person the owner "
+               "gave access to, not the owner. Their chat is separate from the owner's. Facts in the reference "
+               "about \"the user\" (phone numbers, accounts, personal details) are the owner's, so don't "
+               "share the owner's personal details with the collaborator. Only the owner can restart the agent or "
+               "press keys.")
+    blocks.append({"type": "text", "text": who + " Current date and time: "
                    + datetime.now().astimezone().strftime("%A %Y-%m-%d %H:%M %Z")})
     return blocks
 
@@ -208,11 +252,10 @@ def clean_lead_in(text, command):
 # ---- Conversation memory (this process only; empty again after a restart) ----------
 HISTORY_MESSAGES = 10
 MAX_HISTORY_ENTRY_CHARS = 3000
-CONVERSATION = deque(maxlen=HISTORY_MESSAGES)
 
 
 def remember(role, text):
-    CONVERSATION.append({"role": role, "content": text})
+    state().conversation.append({"role": role, "content": text})
 
 
 def remember_assistant(text):  # registered as an imessage_common send hook in main()
@@ -222,7 +265,7 @@ def remember_assistant(text):  # registered as an imessage_common send hook in m
 def history_messages(current):
     """The last HISTORY_MESSAGES messages in API form, ending with the user's `current`
     message: starts with a user turn, same-role neighbours merged, long entries clipped."""
-    entries = list(CONVERSATION)
+    entries = list(state().conversation)
     if not entries or entries[-1]["role"] != "user" or entries[-1]["content"] != current:
         entries.append({"role": "user", "content": current})
     while entries and entries[0]["role"] != "user":
@@ -373,28 +416,31 @@ def is_status_request(msg):
     return bool(STATUS_RE.search(msg) or UPDATE_RE.search(msg))
 
 
-def bridge_pid():
-    """PID of the running bridge (from its lock file), or None."""
-    if BRIDGE_PROC is not None:
-        BRIDGE_PROC.poll()  # reap it if it exited, so a zombie isn't "alive"
+def bridge_pid(person=None):
+    """PID of `person`'s running bridge (default: whoever is being handled), from its lock file, or None."""
+    person = person or CURRENT_PERSON
+    proc = STATES[person].bridge_proc if person in STATES else None
+    if proc is not None:
+        proc.poll()  # reap it if it exited, so a zombie isn't "alive"
     try:
-        with open(BRIDGE_LOCK_FILE) as f:
+        with open(bridge_lock_file(person)) as f:
             pid = int(f.read().strip())
-        if BRIDGE_PROC is not None and BRIDGE_PROC.pid == pid and BRIDGE_PROC.returncode is not None:
+        if proc is not None and proc.pid == pid and proc.returncode is not None:
             return None
         os.kill(pid, 0)
         return pid
     except (OSError, ValueError):
         # No lock yet: a bridge we just launched is still starting up
-        if BRIDGE_PROC is not None and BRIDGE_PROC.poll() is None:
-            return BRIDGE_PROC.pid
+        if proc is not None and proc.poll() is None:
+            return proc.pid
         return None
 
 
-def bridge_active():
+def bridge_active(person=None):
     # The lock file appears a moment after launch; the handle covers that gap
-    return bridge_pid() is not None or (
-        BRIDGE_PROC is not None and BRIDGE_PROC.poll() is None)
+    person = person or CURRENT_PERSON
+    proc = STATES[person].bridge_proc if person in STATES else None
+    return bridge_pid(person) is not None or (proc is not None and proc.poll() is None)
 
 
 # ---- Command safety ---------------------------------------------------------
@@ -560,6 +606,9 @@ def find_project_folder(norm):
     return norm if norm in matches else (matches[0] if matches else None)
 
 
+# Commands only the owner (not the collaborator) may use
+OWNER_ONLY_MESSAGE = "Sorry, only the owner can do that."
+
 EMPTY_NAME = 'empty-name'
 
 
@@ -598,14 +647,23 @@ def list_projects():
 
 
 def ask_for_project():
-    global PENDING_PROJECT_UNTIL
-    PENDING_PROJECT_UNTIL = time.time() + PROJECT_REPLY_TIMEOUT
+    state().pending_project_until = time.time() + PROJECT_REPLY_TIMEOUT
     send_imessage("Which project? Reply with a name. I'll open it if it exists "
                   "or create it if it doesn't.")
 
 
+def other_user_holding(project):
+    """True (after telling the sender) if the OTHER person has a live session in `project`.
+    The bridge claims the folder for real; this is just the early, friendly no."""
+    holder = project_holder(project)
+    if holder and holder[1] != CURRENT_PERSON:
+        send_imessage(f"The other user is already running Claude Code in {os.path.basename(project)}. "
+                      "Pick a different project, or try again once they're done.")
+        return True
+    return False
+
+
 def start_bridge(path_arg):
-    global BRIDGE_PROC
     if bridge_active():
         send_imessage("Claude Code is already running.")
         return
@@ -614,6 +672,8 @@ def start_bridge(path_arg):
     project, created, error = resolve_project(path_arg)
     if error == EMPTY_NAME:
         return ask_for_project()  # nothing usable in that name: just ask again
+    if other_user_holding(project):
+        return
     if created:
         try:
             os.makedirs(project, exist_ok=True)
@@ -628,8 +688,8 @@ def start_bridge(path_arg):
         send_imessage("Starting Claude Code...")
     log = open(BRIDGE_LOG, 'a')
     # New session so the bridge survives this agent and can be killed as a group
-    BRIDGE_PROC = subprocess.Popen(
-        [sys.executable, BRIDGE_SCRIPT, project], cwd=PROJECT_DIR,
+    state().bridge_proc = subprocess.Popen(
+        [sys.executable, BRIDGE_SCRIPT, project, '--owner', CURRENT_PERSON], cwd=PROJECT_DIR,
         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
 
 
@@ -652,7 +712,7 @@ def stop_bridge():
     # (The kill-switch app sends SIGTERM directly and skips that on purpose.)
     # A bridge with no lock file yet is still starting and isn't reading
     # messages, so waiting for it would only burn the whole grace period.
-    if not (os.path.exists(BRIDGE_LOCK_FILE) and wait_for_bridge_exit(STOP_GRACE_SECONDS)):
+    if not (os.path.exists(bridge_lock_file(CURRENT_PERSON)) and wait_for_bridge_exit(STOP_GRACE_SECONDS)):
         try:
             os.kill(pid, signal.SIGTERM)  # the bridge shuts Claude Code down cleanly
         except ProcessLookupError:
@@ -670,7 +730,7 @@ def stop_bridge():
                           f"{pid} manually.")
             return
     try:
-        os.remove(BRIDGE_LOCK_FILE)
+        os.remove(bridge_lock_file(CURRENT_PERSON))
     except OSError:
         pass
     send_imessage("Claude Code session ended.")
@@ -725,10 +785,10 @@ def format_duration(seconds):
     return f"{days}d {hours}h"
 
 
-def read_bridge_state(pid):
+def read_bridge_state(pid, person=None):
     """The bridge's state file, but only if it belongs to the live process `pid`."""
     try:
-        with open(BRIDGE_STATE_FILE, encoding='utf-8') as f:
+        with open(bridge_state_file(person or CURRENT_PERSON), encoding='utf-8') as f:
             state = json.load(f)
         return state if state.get('pid') == pid else None
     except (OSError, ValueError):
@@ -744,21 +804,32 @@ def status_report():
     pid = bridge_pid()
     if pid is None:
         lines.append("Claude Code: no active session.")
-        return '\n'.join(lines)
-    state = read_bridge_state(pid)
-    if not state:
+        lines.append(other_user_line())
+        return '\n'.join(line for line in lines if line)
+    bridge = read_bridge_state(pid)
+    if not bridge:
         lines.append("Claude Code: session active (still starting up, no details yet).")
         return '\n'.join(lines)
-    lines.append(f"Claude Code: active in {state.get('project_name', '?')} "
-                 f"(running for {format_duration(now - state.get('started_at', now))}, "
-                 f"sending to {state.get('sending_to', '?')})")
-    last = (state.get('last_sent') or '').strip()
+    lines.append(f"Claude Code: active in {bridge.get('project_name', '?')} "
+                 f"(running for {format_duration(now - bridge.get('started_at', now))}, "
+                 f"sending to {bridge.get('sending_to', '?')})")
+    last = (bridge.get('last_sent') or '').strip()
     if last:
-        ago = format_duration(now - state.get('last_sent_at', now))
+        ago = format_duration(now - bridge.get('last_sent_at', now))
         lines.append(f"\nLast message the bridge sent ({ago} ago):\n{last[:600]}")
     else:
         lines.append("\nThe bridge hasn't sent anything yet.")
-    return '\n'.join(lines)
+    lines.append(other_user_line())
+    return '\n'.join(line for line in lines if line)
+
+
+def other_user_line():
+    """A line about the other person's session, so nobody picks a project that is taken."""
+    others = [p for p in PEOPLE if p != CURRENT_PERSON]
+    if not others or bridge_pid(others[0]) is None:
+        return ''
+    info = read_bridge_state(bridge_pid(others[0]), others[0]) or {}
+    return f"The other user has a Claude Code session in {info.get('project_name', 'a project')}."
 
 
 def press_key(name):
@@ -816,11 +887,10 @@ def restart_agent():
 
 def handle_pending_project(msg):
     """The reply to "Which project?". True if the message was consumed."""
-    global PENDING_PROJECT_UNTIL
-    if not PENDING_PROJECT_UNTIL:
+    if not state().pending_project_until:
         return False
-    expired = time.time() > PENDING_PROJECT_UNTIL
-    PENDING_PROJECT_UNTIL = 0.0  # one-shot either way
+    expired = time.time() > state().pending_project_until
+    state().pending_project_until = 0.0  # one-shot either way
     if expired:
         return False  # too late: treat it as an ordinary message
     if is_agent_command(msg) or STOP_RE.match(msg):
@@ -855,11 +925,17 @@ def handle_bridge_command(msg):
         show_memory(match.group(1))
         return True
     if RESTART_RE.match(msg):
-        restart_agent()
+        if CURRENT_PERSON != OWNER:
+            send_imessage(OWNER_ONLY_MESSAGE)
+        else:
+            restart_agent()
         return True
     match = PRESS_RE.match(msg)
     if match:
-        press_key(match.group(1))
+        if CURRENT_PERSON != OWNER:
+            send_imessage(OWNER_ONLY_MESSAGE)  # keystrokes go to the app in front on the owner's Mac
+        else:
+            press_key(match.group(1))
         return True
     if is_status_request(msg):
         send_imessage(status_report())
@@ -868,19 +944,19 @@ def handle_bridge_command(msg):
 
 
 def process_command(user_message):
-    global PENDING_ACTION
+    me = state()  # this person's own pending proposal and history
 
     reply = user_message.strip()
-    if PENDING_ACTION:
-        needs_confirm = PENDING_ACTION.get('confirm')
+    if me.pending_action:
+        needs_confirm = me.pending_action.get('confirm')
         if reply.upper() in ('NO', 'N'):
-            PENDING_ACTION = {}
+            me.pending_action = {}
             send_imessage("Got it — cancelled.")
             return
         approved = reply == 'CONFIRM' if needs_confirm else reply.upper() in ('YES', 'Y')
         if approved:
-            action = PENDING_ACTION
-            PENDING_ACTION = {}
+            action = me.pending_action
+            me.pending_action = {}
             if action['type'] == 'terminal':
                 pattern = blocked_pattern(action['command'])
                 if pattern:  # can't happen via the normal path; never run it anyway
@@ -895,7 +971,7 @@ def process_command(user_message):
             send_imessage(CONFIRM_HINT)  # keep waiting: YES / lowercase isn't enough
             return
         # Anything else abandons the proposal, so a late "YES" can't run it
-        PENDING_ACTION = {}
+        me.pending_action = {}
 
     try:
         response = client.messages.create(
@@ -909,8 +985,8 @@ def process_command(user_message):
     except anthropic.APIError as e:
         # Tell the user instead of going silent (e.g. "credit balance is too low").
         reason = (getattr(e, "message", None) or str(e)).strip().replace("\n", " ")[:200]
-        if CONVERSATION and CONVERSATION[-1]["role"] == "user":
-            CONVERSATION.pop()  # the failed turn is not part of the conversation
+        if state().conversation and state().conversation[-1]["role"] == "user":
+            state().conversation.pop()  # the failed turn is not part of the conversation
         send_imessage(f"I couldn't reach the AI service ({reason}). Commands like status, "
                       "list projects and restart agent still work.", hooks=False)
         return
@@ -922,8 +998,8 @@ def process_command(user_message):
     if tool_call is None:
         if not text or text.startswith("IGNORE"):
             print("Ignored automated message" if text else "Model returned nothing")
-            if CONVERSATION and CONVERSATION[-1]["role"] == "user":
-                CONVERSATION.pop()  # not part of the conversation
+            if state().conversation and state().conversation[-1]["role"] == "user":
+                state().conversation.pop()  # not part of the conversation
             return
         send_imessage(plain_text(text))  # plain conversation
         return
@@ -936,12 +1012,12 @@ def process_command(user_message):
 
     pattern = blocked_pattern(command)
     if pattern:
-        PENDING_ACTION = {}
+        me.pending_action = {}
         log_blocked(command, pattern, user_message)
         send_imessage(BLOCKED_MESSAGE)
         return
     confirm = risky_pattern(command) is not None
-    PENDING_ACTION = {'type': 'terminal', 'command': command, 'confirm': confirm}
+    me.pending_action = {'type': 'terminal', 'command': command, 'confirm': confirm}
     ending = CONFIRM_ENDING if confirm else "Reply YES to confirm or NO to cancel."
     lead_in = clean_lead_in(text, command)
     lead_in = f"{lead_in}\n\n" if lead_in else ""
@@ -949,12 +1025,16 @@ def process_command(user_message):
 
 
 def handle_incoming(row, msg):
-    """Handle one message from the user (row from get_messages_after)."""
+    """Handle one message from the user or collaborator (row from get_messages_after)."""
+    global CURRENT_PERSON
     rowid = row[0]
     reason = own_message_reason(msg, row[4])
     if reason:
         print(f"Skipping message (rowid {rowid}, {reason}): {msg[:60]!r}")
         return
+
+    # Whose message is this? Their own history, pending YES/NO and Claude Code session apply.
+    CURRENT_PERSON = person_for(row[5] if len(row) > 5 else None)
 
     # Reply in the thread this message came from. While a bridge session owns
     # the chat its replies are the bridge's business (it tracks the thread itself);
@@ -977,7 +1057,7 @@ def handle_incoming(row, msg):
         print(f"Bridge session active, skipping rowid {rowid}")
         return
 
-    print(f"New message (rowid {rowid}, from {row[5] if len(row) > 5 else '?'}): {msg}")
+    print(f"New message (rowid {rowid}, from {row[5] if len(row) > 5 else '?'} = {CURRENT_PERSON}): {msg}")
     try:
         process_command(msg)
     except Exception as e:
@@ -994,13 +1074,17 @@ def main():
 
     print("iMessage agent running — waiting for messages...")
     print(f"Replying in the thread you text from (currently: {reply_target()[0]}; "
-          f"fallback {REPLY_ADDRESS}) | agent identity: {AGENT_ADDRESS} | user addresses: {', '.join(WATCH_IDENTIFIERS)}")
+          f"fallback {REPLY_ADDRESS}) | agent identity: {AGENT_ADDRESS} | user addresses: {', '.join(WATCH_IDENTIFIERS)} | people: {', '.join(PEOPLE)}")
 
     # Only messages that arrive after startup are considered
     last_rowid = get_latest_rowid()
     print(f"Starting from rowid: {last_rowid}")
 
     imessage_common.SEND_HOOKS.append(remember_assistant)  # keep a transcript of what the agent says
+    # Only the owner is told about restarts (the collaborator would be notified too often)
+    global CURRENT_PERSON
+    CURRENT_PERSON = OWNER
+    set_reply_target(imessage_common.person_addresses(OWNER)[0])
     send_imessage("Agent online. Send me a command.")
 
     empty_polls = {}

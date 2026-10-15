@@ -37,11 +37,17 @@ IMESSAGE_SEND_ADDRESS = _get('IMESSAGE_SEND_ADDRESS')
 # Other addresses of yours the iPhone might text the agent from (comma-separated).
 # Their messages are read; replies still go to AGENT_PHONE_NUMBER.
 EXTRA_USER_ADDRESSES = _csv('EXTRA_USER_ADDRESSES')
+# A second person who may use the agent exactly like you: commands, Claude Code
+# sessions, the morning brief. Unlike EXTRA_USER_ADDRESSES (more addresses of YOU, all
+# answered in your chat), their replies go to their OWN chat. Blank = no collaborator.
+COLLABORATOR_PHONE = _get('COLLABORATOR_PHONE')
 PROJECTS_DIR = os.path.expanduser(_get('PROJECTS_DIR') or '~/projects')
 CHAT_DB = os.path.expanduser(_get('CHAT_DB') or '~/Library/Messages/chat.db')
 LAUNCHD_LABEL = _get('LAUNCHD_LABEL') or 'com.example.imessageagent'
 LOCATION = _get('LOCATION') or 'Washington DC'  # used for the morning brief's weather, and told to Claude so it can tailor the brief
 BRIEF_TIME = _get('BRIEF_TIME') or '07:00'  # 24-hour HH:MM, local time
+# whisper.cpp model used to transcribe voice messages sent to a Claude Code session
+WHISPER_MODEL = os.path.expanduser(_get('WHISPER_MODEL') or '~/.cache/whisper/ggml-small.en.bin')
 
 
 def _parse_time(text):
@@ -69,6 +75,11 @@ def problems():
         found.append("IMESSAGE_SEND_ADDRESS must be the agent's Apple ID email, e.g. agent@icloud.com")
     elif IMESSAGE_SEND_ADDRESS.lower() in {a.lower() for a in (AGENT_PHONE_NUMBER, *EXTRA_USER_ADDRESSES)}:
         found.append("IMESSAGE_SEND_ADDRESS must differ from your own addresses (that is what avoids double bubbles)")
+    if COLLABORATOR_PHONE:
+        if not re.fullmatch(r'\+\d{7,15}', COLLABORATOR_PHONE) or _PLACEHOLDER.search(COLLABORATOR_PHONE):
+            found.append("COLLABORATOR_PHONE must be their number in international form, e.g. +15555550123 (or leave it blank)")
+        elif COLLABORATOR_PHONE in (AGENT_PHONE_NUMBER, *EXTRA_USER_ADDRESSES):
+            found.append("COLLABORATOR_PHONE must differ from your own addresses")
     if _PLACEHOLDER.search(PROJECTS_DIR):
         found.append("PROJECTS_DIR is still the placeholder (/Users/yourname/projects)")
     if _parse_time(BRIEF_TIME) is None:
@@ -93,5 +104,6 @@ if __name__ == '__main__':
     print(f"  texts go to        : {AGENT_PHONE_NUMBER}")
     print(f"  agent Apple ID     : {IMESSAGE_SEND_ADDRESS}")
     print(f"  also reads from    : {', '.join(EXTRA_USER_ADDRESSES) or '(none)'}")
+    print(f"  collaborator       : {COLLABORATOR_PHONE or '(none)'}")
     print(f"  projects folder    : {PROJECTS_DIR}")
     print(f"  morning brief      : {BRIEF_TIME} for {LOCATION}")

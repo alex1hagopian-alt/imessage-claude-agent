@@ -4,9 +4,9 @@
     python morning_brief.py             send one brief now and exit (use this from launchd)
     python morning_brief.py --schedule  stay running and send one every day at BRIEF_TIME
 
-The brief starts the conversation, so it has a FIXED destination: your phone number
-(AGENT_PHONE_NUMBER), in the chat that belongs to the agent's Apple ID. It never sends
-to IMESSAGE_SEND_ADDRESS — that is the Mac's own identity, which would be the Mac
+The brief starts the conversation, so it has FIXED destinations: your phone number
+(AGENT_PHONE_NUMBER) and, if set, COLLABORATOR_PHONE, each in its own chat that belongs to
+the agent's Apple ID. It never sends to IMESSAGE_SEND_ADDRESS — that is the Mac's own identity, which would be the Mac
 texting itself. Settings come from .env (see config.example.env).
 """
 import argparse
@@ -25,7 +25,7 @@ import config
 
 client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY or None)
 HEADERS = {'User-Agent': 'curl/7.68.0'}
-BRIEF_CHAT_GUID = f'iMessage;-;{config.AGENT_PHONE_NUMBER}'
+BRIEF_CHAT_GUIDS = [f'iMessage;-;{number}' for number in (config.AGENT_PHONE_NUMBER, config.COLLABORATOR_PHONE) if number]
 # The agent ignores a text that matches this file, so the brief is never mistaken for a command.
 BRIEF_TEXT_FILE = '/tmp/brief_text.txt'
 SEND_SCRIPT_FILE = '/tmp/send_brief.scpt'
@@ -83,15 +83,21 @@ def get_news():
 
 
 def send_imessage(brief):
+    """Send the brief to every destination. True only if every send succeeded; one
+    failing chat never stops the others."""
     with open(BRIEF_TEXT_FILE, 'w', encoding='utf-8') as f:
         f.write(brief)
+    results = [send_to_chat(brief, guid) for guid in BRIEF_CHAT_GUIDS]
+    return all(results)
 
+
+def send_to_chat(brief, chat_guid):
     # AppleScript reads the file content and sends it
     script = f'''set briefFile to open for access POSIX file "{BRIEF_TEXT_FILE}"
 set briefText to read briefFile as «class utf8»
 close access briefFile
 tell application "Messages"
-send briefText to chat id "{BRIEF_CHAT_GUID}"
+send briefText to chat id "{chat_guid}"
 end tell'''
     with open(SEND_SCRIPT_FILE, 'w', encoding='utf-8') as f:
         f.write(script)

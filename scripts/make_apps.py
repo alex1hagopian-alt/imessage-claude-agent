@@ -32,7 +32,7 @@ def sources():
     plist = os.path.expanduser(f'~/Library/LaunchAgents/{label}.plist')
     stop = f"""-- Flag first so nothing restarts, then unload the jobs, then kill stragglers.
 do shell script {q(f"touch '{flag}'")}
-do shell script {q(f"launchctl bootout gui/$(id -u)/{label} >/dev/null 2>&1; launchctl bootout gui/$(id -u)/{label}.morningbrief >/dev/null 2>&1; pkill -f '[c]laude_code_bridge.py'; pkill -f '[m]orning_brief.py'; pkill -f '[i]message_agent.py'; rm -f /tmp/claude_bridge.lock; true")}
+do shell script {q(f"launchctl bootout gui/$(id -u)/{label} >/dev/null 2>&1; launchctl bootout gui/$(id -u)/{label}.morningbrief >/dev/null 2>&1; pkill -f '[c]laude_code_bridge.py'; pkill -f '[m]orning_brief.py'; pkill -f '[i]message_agent.py'; rm -f /tmp/claude_bridge.lock /tmp/claude_bridge_collaborator.lock; true")}
 display notification "AI Agent stopped — all scripts have been shut down" with title "Stop AI Agent"
 """
     start = f"""do shell script {q(f"rm -f '{flag}'")}

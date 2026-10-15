@@ -24,3 +24,6 @@ venv/
 # holds your phone number, addresses and setup history: publish a sanitized copy
 # if you want one, never this file.
 CLAUDE.md
+
+# Photos and voice notes copied in from iMessage
+.imessage-inbox/

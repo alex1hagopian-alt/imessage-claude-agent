@@ -17,7 +17,7 @@ It runs entirely on your own Mac, reading the local Messages database and sendin
 - An iPhone with iMessage
 - A **second Apple ID** for the Mac (see below)
 
-Optional: Accessibility permission for Python, only needed for the `press enter` family of commands.
+Optional: Accessibility permission for Python, only needed for the `press enter` family of commands. For voice notes: `brew install whisper-cpp ffmpeg` and a model such as `ggml-small.en.bin` at `~/.cache/whisper/` (or set `WHISPER_MODEL`).
 
 ## Why a separate Apple ID
 
@@ -76,12 +76,21 @@ Everything personal lives in `.env` (git-ignored); `config.example.env` document
 | `IMESSAGE_SEND_ADDRESS` | yes | The agent's Apple ID address, signed into Messages on the Mac. Must differ from your own addresses. |
 | `PROJECTS_DIR` | no | Where `start claude <name>` opens or creates projects. Default `~/projects`. |
 | `EXTRA_USER_ADDRESSES` | no | Other addresses of yours (comma-separated) to also read messages from. |
+| `COLLABORATOR_PHONE` | no | A second person's number (international form) who can use the agent exactly like you. See [Collaborator](#collaborator). Blank or absent = off. |
 | `LAUNCHD_LABEL` | no | launchd job label. Default `com.example.imessageagent`. |
 | `LOCATION` | no | Where you are, e.g. `Washington DC` (default). Used for the brief's weather and told to Claude so it can tailor the brief. |
 | `BRIEF_TIME` | no | Send time for the morning brief, 24h `HH:MM` (default `07:00`). |
 | `CHAT_DB` | no | Path to the Messages database. Default `~/Library/Messages/chat.db`. |
 
-The agent only acts on messages from your own addresses (`AGENT_PHONE_NUMBER` plus `EXTRA_USER_ADDRESSES`) that were received by the agent's Apple ID. Texts from anyone else are ignored.
+The agent only acts on messages from your own addresses (`AGENT_PHONE_NUMBER` plus `EXTRA_USER_ADDRESSES`) that were received by the agent's Apple ID. Texts from anyone else are ignored. If `COLLABORATOR_PHONE` is set, that number is trusted too.
+
+## Collaborator
+
+Set `COLLABORATOR_PHONE=+1...` in `.env` (remove the line to turn it off) and restart the agent. The collaborator texts the same agent Apple ID and can do everything you can: commands, free-text chat, Claude Code sessions, and the morning brief. Unlike `EXTRA_USER_ADDRESSES` (more addresses of *you*, all answered in your chat), their replies go to **their own chat**.
+
+- Each person has their own conversation history, pending `YES`/`CONFIRM`, `Which project?` prompt, and Claude Code session. Your `YES` never answers their permission prompt, and the bridge ignores the other person's texts.
+- You can each run one session at a time, in different projects. Two sessions can't use the same folder: the second person gets "The other user is already running Claude Code in <project>". `status` also tells you if the other user has a session.
+- Everything is shared on the Mac: `list projects`, `memory <project>`, the command blocklist, and the kill switch. A collaborator can propose terminal commands (with your confirm tiers) and read project memory, so only add someone you trust. `restart agent` and `press enter|space|escape` are owner-only.
 
 ## iMessage commands
 
@@ -102,9 +111,17 @@ Text the agent's address from your iPhone.
 
 During a Claude Code session, permission requests arrive as a menu: reply `1` (yes), `2` (yes and don't ask again for this session), `3`/`no`, or type feedback for Claude. When it finishes you get a summary; reply with a follow-up task, `DONE` to end, or `STOP` at any time. Long messages are split into labelled parts (`Part 1/3: ...`).
 
+### Photos, voice notes and files
+
+During a Claude Code session you can text photos, voice notes and files. They are copied into `<project>/.imessage-inbox/` and described to Claude in your message. Photos (HEIC and similar are converted to JPEG) are opened with Claude's Read tool. Voice notes are transcribed locally with whisper.cpp and the transcript is texted back as `Heard: "..."`. Videos and files over 50 MB are skipped. A voice note is never treated as `yes`/`stop`, so approvals stay typed. Inbox files are deleted after 24 hours (checked when a session starts and whenever a new attachment arrives). Add `.imessage-inbox/` to the project's `.gitignore`.
+
+### Trusted mode
+
+By default, Claude Code sessions don't ask about routine actions: non-risky shell commands, edits inside the project folder, reads (except secrets) and web tools are auto-allowed. Risky shell commands (elevated privileges, deletes, `>` overwrite, installs, `.env`/`.ssh`/`.aws`), writes outside the project, secret paths and unknown tools still ask; blocklisted commands are denied. Start the bridge with `--ask-all` to be asked about everything. This applies to Claude Code sessions only, never to texts to the agent itself. It is a pattern guard, not a sandbox.
+
 ## Morning brief
 
-`morning_brief.py` fetches the weather for your `LOCATION`, the top Hugging Face daily papers and AI-related Hacker News stories, asks Claude to summarize them in a few sentences, and texts the result to `AGENT_PHONE_NUMBER`. It starts the conversation, so it always sends to your phone number and never consults reply routing. Run `venv/bin/python morning_brief.py` for one now, or install the daily job with `scripts/install_launchd.py --job brief --load` (time from `BRIEF_TIME`). The agent recognizes the brief and never treats it as a command.
+`morning_brief.py` fetches the weather for your `LOCATION`, the top Hugging Face daily papers and AI-related Hacker News stories, asks Claude to summarize them in a few sentences, and texts the result to `AGENT_PHONE_NUMBER` (and `COLLABORATOR_PHONE`, if set, in their own chat). It starts the conversation, so it always sends to your phone number and never consults reply routing. Run `venv/bin/python morning_brief.py` for one now, or install the daily job with `scripts/install_launchd.py --job brief --load` (time from `BRIEF_TIME`). The agent recognizes the brief and never treats it as a command.
 
 ## Safety features
 
@@ -123,6 +140,7 @@ This tool can run commands on your computer from a text message. It has guards, 
 |---|---|
 | `imessage_agent.py` | The always-on agent: reads messages, handles commands, starts the bridge. |
 | `claude_code_bridge.py` | Runs one headless Claude Code session and relays its prompts and results. |
+| `attachments.py` | Copies photos/voice notes into the project and transcribes audio. |
 | `imessage_common.py` | Shared sending code: splitting, labelling, echo tracking. |
 | `config.py`, `config.example.env` | Settings loaded from `.env`, and a template for it. |
 | `morning_brief.py` | The daily brief. |

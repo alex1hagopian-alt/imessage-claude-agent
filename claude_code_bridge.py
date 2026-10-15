@@ -25,11 +25,11 @@ import sys
 import threading
 import time
 
+import attachments
 import imessage_agent as im
 import imessage_common
-from imessage_common import reply_target, send_imessage, set_reply_target
+from imessage_common import OWNER, person_for, reply_target, send_imessage, set_reply_target
 
-LOCK_FILE = im.BRIDGE_LOCK_FILE
 # Always passed to claude explicitly, so sessions don't depend on whatever model
 # the Claude Code install happens to have configured. Override with --model.
 DEFAULT_MODEL = 'claude-sonnet-5-5'
@@ -67,13 +67,47 @@ NO_EXPLANATION = "(No plain-English explanation was provided for this command.)"
 NOTHING_DONE_RE = re.compile(
     r"nothing\s+(?:was|has\s+been)\s+(?:changed|done|modified)|nothing\s+worth\s+saving"
     r"|no\s+changes\s+(?:were|have\s+been)\s+made", re.IGNORECASE)
-# Terminal-only advice that is useless over iMessage; it means Claude is telling the user to quit.
-TERMINAL_ONLY_RE = re.compile(
-    r"\bctrl\s*[-+]\s*[cd]\b|\bcontrol\s*[-+]\s*[cd]\b|(?<![\w/.~-])/(?:exit|quit)\b(?![\w./-])",
-    re.IGNORECASE)
 
 NEW_PROJECT_PROMPT = ("This is a new project called {name}. "
                       "Wait for the user to describe what they want to build.")
+
+# Trusted mode (default): inside a running session most requests are approved without
+# texting. Only these still ask: Bash commands the agent's CONFIRM tier flags (sudo, rm,
+# overwrite, pip/npm install, .env/.ssh/.aws), file access outside the project or to
+# secrets, and tools we don't recognise. Blocked commands (rm -rf, ...) are always denied.
+# `--ask-all` restores asking for everything.
+SENSITIVE_PATH_RE = re.compile(r'(^|/)(\.env[^/]*|\.ssh|\.aws|\.gnupg|id_rsa[^/]*)(/|$)', re.IGNORECASE)
+FILE_TOOLS = ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
+READ_TOOLS = ('Read', 'Glob', 'Grep')
+HARMLESS_TOOLS = ('WebFetch', 'WebSearch', 'TodoWrite', 'Task', 'Agent', 'BashOutput',
+                  'KillShell', 'ExitPlanMode', 'NotebookRead')
+
+
+def auto_decision(tool, tool_input, project_dir):
+    """('allow', '') / ('deny', reason) / (None, '') = ask the user."""
+    if tool == 'Bash':
+        command = str(tool_input.get('command', ''))
+        pattern = im.blocked_pattern(command)
+        if pattern:
+            im.log_blocked(command, pattern, 'claude code session')
+            return 'deny', f"Blocked by the safety rules (matches '{pattern}'). Use a safer approach."
+        return (None, '') if im.risky_pattern(command) else ('allow', '')
+    if tool in FILE_TOOLS or tool in READ_TOOLS:
+        raw = (tool_input.get('file_path') or tool_input.get('notebook_path')
+               or tool_input.get('path') or '')
+        if not raw:
+            return ('allow', '') if tool in READ_TOOLS else (None, '')
+        path = os.path.realpath(os.path.join(project_dir, os.path.expanduser(raw)))
+        if SENSITIVE_PATH_RE.search(path):
+            return None, ''
+        inside = path == project_dir or path.startswith(project_dir + os.sep)
+        if tool in FILE_TOOLS:
+            return ('allow', '') if inside else (None, '')
+        return 'allow', ''
+    if tool in HARMLESS_TOOLS:
+        return 'allow', ''
+    return None, ''
+
 
 YES_WORDS = {'1', 'YES', 'Y', 'OK', 'ALLOW', 'APPROVE'}
 ALWAYS_WORDS = {'2', 'ALWAYS'}
@@ -172,7 +206,9 @@ def describe_suggestion(suggestion):
 
 class Bridge:
     def __init__(self, project_dir, permission_mode='default', model=DEFAULT_MODEL,
-                 send=None, claude_bin='claude'):
+                 send=None, claude_bin='claude', owner=OWNER, trusted=True):
+        self.trusted = trusted  # auto-approve routine requests (see auto_decision)
+        self.owner = owner  # whose session this is: only their texts count, replies go to their chat
         self.project_dir = os.path.abspath(project_dir)
         self.name = os.path.basename(self.project_dir)
         self.permission_mode = permission_mode
@@ -199,7 +235,7 @@ class Bridge:
     def write_state(self):
         if not self.state_file:
             return
-        state = {'pid': os.getpid(), 'project': self.project_dir,
+        state = {'pid': os.getpid(), 'owner': self.owner, 'project': self.project_dir,
                  'project_name': self.name, 'started_at': self.started_at,
                  'sending_to': reply_target()[0],
                  'last_sent': self.last_sent, 'last_sent_at': self.last_sent_at}
@@ -232,7 +268,16 @@ class Bridge:
         for row in im.get_messages_after(self.cursor):
             rowid = row[0]
             msg = im.parse_message(row)
-            if msg is None:
+            chat = row[5] if len(row) > 5 else None
+            atts = attachments.lookup(rowid) if person_for(chat) == self.owner else []
+            # an attachment-only message has just the object-replacement character
+            typed = (msg or '').replace('\ufffc', '').strip()
+            if atts and not all(attachments.is_ready(a) for a in atts):
+                # still downloading: retry a few polls, then use what there is
+                self.empty_polls[rowid] = self.empty_polls.get(rowid, 0) + 1
+                if self.empty_polls[rowid] < im.MAX_EMPTY_POLLS:
+                    break
+            elif msg is None and not atts:
                 # body may not be written yet: retry a few polls, then skip
                 self.empty_polls[rowid] = self.empty_polls.get(rowid, 0) + 1
                 if self.empty_polls[rowid] < im.MAX_EMPTY_POLLS:
@@ -242,15 +287,34 @@ class Bridge:
                 continue
             self.empty_polls.pop(rowid, None)
             self.cursor = rowid
-            reason = im.own_message_reason(msg, row[4])
-            if reason is None and im.is_agent_command(msg):
+            if person_for(chat) != self.owner:
+                # The other person's texts are the agent's business; they must never
+                # answer this session's permission prompts or give it tasks.
+                log(f"IGNORED rowid {rowid} (from the other user, {chat})")
+                continue
+            msg = typed
+            reason = im.own_message_reason(msg, row[4]) if msg else None
+            if reason is None and msg and im.is_agent_command(msg):
                 reason = 'command for the agent'
             if reason:
                 log(f"IGNORED rowid {rowid} ({reason}): {one_line(msg, 120)}")
                 continue
-            chat = row[5] if len(row) > 5 else None
-            log(f"RECEIVED rowid {rowid} (from {chat}): {one_line(msg, 300)}")
+            if not msg and not atts:
+                continue
+            log(f"RECEIVED rowid {rowid} (from {chat}): {one_line(msg, 300)}"
+                f"{f' + {len(atts)} attachment(s)' if atts else ''}")
             set_reply_target(chat)  # our replies follow whichever thread the user texts from
+            if atts:
+                try:
+                    attachments.cleanup(self.project_dir)
+                    block, notes = attachments.prepare(rowid, atts, self.project_dir)
+                except Exception as e:  # never lose the message over an attachment problem
+                    log(f"attachment handling failed for rowid {rowid}: {e!r}")
+                    block, notes = '', ["Couldn't process the attachment."]
+                for note in notes:
+                    log(f"attachment note: {note}")
+                    self.notify(note)
+                msg = (msg + '\n\n' + block).strip()
             texts.append(msg)
         return texts
 
@@ -350,6 +414,12 @@ class Bridge:
                                      'error': 'unsupported request'}})
             return
         tool_input = req.get('input', {})
+        if self.trusted:
+            decision, why = auto_decision(req.get('tool_name', '?'), tool_input, self.project_dir)
+            if decision:
+                log(f"auto-{decision}: {one_line(describe_tool_request(req.get('tool_name', '?'), tool_input), 200)}")
+                self.answer_permission(request_id, decision == 'allow', tool_input, why)
+                return
         # "Don't ask again" = Claude's own suggestions, kept to this session
         # so nothing is written into the project's settings files.
         suggestions = [dict(sg, destination='session')
@@ -492,6 +562,7 @@ class Bridge:
 
     def _session(self, first_task=None):
         self.start()
+        attachments.cleanup(self.project_dir)
         self.notify(f"Session started in {self.project_dir}")
         if self.is_new_project():
             # Brief Claude Code first so it waits for direction. Its reply to
@@ -518,13 +589,6 @@ class Bridge:
                 self.handle_control_request(event)
             elif kind == 'result':
                 self.turn_active = False
-                text = event.get('result') or ''
-                if TERMINAL_ONLY_RE.search(text):
-                    # Claude is telling the user to quit from a terminal, which
-                    # they can't do from a phone: close instead of forwarding it.
-                    log(f"terminal-only instructions in result; closing: {one_line(text, 200)}")
-                    self.update_memory()
-                    return self.notify("Session ended.")
                 self.note_result(event)
                 if self.preamble_pending and not event.get('is_error'):
                     self.preamble_pending = False
@@ -560,7 +624,7 @@ class Bridge:
                 self.proc.kill()
 
 
-def startup_debug():
+def startup_debug(owner=OWNER):
     """First thing the bridge does: record in send_debug.log exactly what it
     loaded and where its first text will go, before anything else can change it."""
     try:
@@ -575,6 +639,7 @@ def startup_debug():
             f"BRIDGE STARTUP pid={os.getpid()} ppid={os.getppid()} python={sys.executable} cwd={os.getcwd()} argv={sys.argv[1:]}",
             f"  imported imessage_common from: {os.path.abspath(imessage_common.__file__)}",
             f"  imported imessage_agent  from: {os.path.abspath(im.__file__)}   (sys.path[0]={sys.path[0]})",
+            f"  owner of this session: {owner}",
             f"  loaded: REPLY_ADDRESS={imessage_common.REPLY_ADDRESS} REPLY_TO_SOURCE_THREAD={imessage_common.REPLY_TO_SOURCE_THREAD} "
             f"WATCH_IDENTIFIERS={imessage_common.WATCH_IDENTIFIERS}",
             f"  last_thread.json ({imessage_common.LAST_THREAD_FILE}) = {last_thread}",
@@ -590,37 +655,57 @@ def startup_debug():
 def main():
     import config
     config.require()  # stop with a clear message if .env is incomplete
-    startup_debug()
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('project_dir')
     parser.add_argument('task', nargs='?', help='first task (otherwise asked over iMessage)')
     parser.add_argument('--permission-mode', default='default',
                         choices=['default', 'acceptEdits', 'plan'],
                         help='bypassPermissions is intentionally not offered')
+    parser.add_argument('--ask-all', action='store_true',
+                        help='text every permission request instead of auto-approving routine ones')
     parser.add_argument('--model', default=DEFAULT_MODEL,
                         help=f'Claude model for the session (default: {DEFAULT_MODEL})')
+    parser.add_argument('--owner', default=OWNER, choices=list(imessage_common.PEOPLE),
+                        help='whose session this is: only their texts are read, replies go to their chat')
     args = parser.parse_args()
+    # Pin where this process texts BEFORE anything is sent: the owner's chat, whatever
+    # a stale last_thread.json says (it may belong to the other person)
+    set_reply_target(imessage_common.person_addresses(args.owner)[0])
+    startup_debug(args.owner)
 
     if not os.path.isdir(args.project_dir):
         sys.exit(f"Not a directory: {args.project_dir}")
     if os.path.exists(im.DISABLED_FLAG):
         sys.exit("AGENT_DISABLED is present; remove it (Start AI Agent.app) first.")
 
-    # Tell imessage_agent.py to stay quiet while this session owns the chat
-    with open(LOCK_FILE, 'w') as f:
+    # One session per project folder, across both people. The agent already says no
+    # in the common case; this is the authoritative, race-free claim.
+    holder = imessage_common.claim_project(args.project_dir, args.owner)
+    if holder:
+        log(f"refusing to start: {args.project_dir} is held by pid {holder[0]} ({holder[1]})")
+        send_imessage(f"Claude Code wasn't started: the other user is already running Claude Code in "
+                      f"{os.path.basename(os.path.abspath(args.project_dir))}. Pick a different project.")
+        sys.exit(1)
+    atexit.register(imessage_common.release_project, args.project_dir)
+
+    # Tell imessage_agent.py to stay quiet for this person while their session owns the chat
+    lock_file = im.bridge_lock_file(args.owner)
+    state_file = im.bridge_state_file(args.owner)
+    with open(lock_file, 'w') as f:
         f.write(str(os.getpid()))
-    atexit.register(lambda: os.path.exists(LOCK_FILE) and os.remove(LOCK_FILE))
-    atexit.register(lambda: os.path.exists(im.BRIDGE_STATE_FILE) and os.remove(im.BRIDGE_STATE_FILE))
+    atexit.register(lambda: os.path.exists(lock_file) and os.remove(lock_file))
+    atexit.register(lambda: os.path.exists(state_file) and os.remove(state_file))
 
     # SIGTERM (from "stop claude") must unwind so Claude Code is shut down too
     def on_sigterm(signum, frame):
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, on_sigterm)
 
-    bridge = Bridge(args.project_dir, args.permission_mode, args.model)
-    bridge.state_file = im.BRIDGE_STATE_FILE
+    bridge = Bridge(args.project_dir, args.permission_mode, args.model, owner=args.owner,
+                    trusted=not args.ask_all)
+    bridge.state_file = state_file
     bridge.write_state()
-    log(f"bridge started (pid {os.getpid()}) for {bridge.project_dir}, replying in {reply_target()}"
+    log(f"bridge started (pid {os.getpid()}, owner {args.owner}) for {bridge.project_dir}, replying in {reply_target()}"
         + (f", first task: {one_line(args.task, 200)}" if args.task else ""))
     try:
         bridge.run(args.task)

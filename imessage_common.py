@@ -8,6 +8,7 @@ Everything either script texts goes through send_imessage(), which
   * remembers what it sent so the echo coming back through chat.db is ignored.
 """
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -34,7 +35,25 @@ USER_PHONE = config.AGENT_PHONE_NUMBER
 USER_ADDRESSES = (USER_PHONE, *config.EXTRA_USER_ADDRESSES)
 REPLY_ADDRESS = USER_PHONE              # default destination before any message arrives
 REPLY_CHAT_GUID = f'iMessage;-;{REPLY_ADDRESS}'
-WATCH_IDENTIFIERS = USER_ADDRESSES      # chat_identifiers of the agent's conversations with the user
+# The optional collaborator is treated like the user, but in their OWN chat: their
+# messages are read and every reply to them goes to their number, never to REPLY_ADDRESS.
+COLLABORATOR_ADDRESSES = (config.COLLABORATOR_PHONE,) if config.COLLABORATOR_PHONE else ()
+WATCH_IDENTIFIERS = USER_ADDRESSES + COLLABORATOR_ADDRESSES  # chat_identifiers of the agent's conversations
+
+# Who is talking. Each person has their own conversation history, pending YES/NO, and
+# Claude Code session (bridge); the agent keeps that state per person.
+OWNER = 'owner'
+COLLABORATOR = 'collaborator'
+PEOPLE = (OWNER, COLLABORATOR) if COLLABORATOR_ADDRESSES else (OWNER,)
+
+
+def person_for(identifier):
+    """OWNER or COLLABORATOR, for the chat_identifier a message came from."""
+    return COLLABORATOR if identifier in COLLABORATOR_ADDRESSES else OWNER
+
+
+def person_addresses(person):
+    return COLLABORATOR_ADDRESSES if person == COLLABORATOR else USER_ADDRESSES
 
 # ---- Which thread a reply goes to -------------------------------------------
 # OFF by default: every reply goes to REPLY_ADDRESS, the user's phone-number chat
@@ -58,12 +77,24 @@ def chat_guid(identifier):
     return f'iMessage;-;{identifier}'  # always the iMessage chat, never the SMS one
 
 
+def reply_address_for(identifier):
+    """The chat a reply to a message from `identifier` goes to. The collaborator's
+    always goes to their own chat; the user's follows REPLY_TO_SOURCE_THREAD."""
+    if identifier in COLLABORATOR_ADDRESSES:
+        return identifier
+    if REPLY_TO_SOURCE_THREAD and identifier in USER_ADDRESSES:
+        return identifier
+    return REPLY_ADDRESS
+
+
 def set_reply_target(identifier):
-    """Record that the user just texted from `identifier`; replies go back there."""
+    """Record who just texted (from `identifier`); replies go back to their chat."""
     global _current_target
-    if not REPLY_TO_SOURCE_THREAD or identifier not in WATCH_IDENTIFIERS:
+    if identifier not in WATCH_IDENTIFIERS:
         return
-    _current_target = identifier
+    _current_target = reply_address_for(identifier)
+    if not REPLY_TO_SOURCE_THREAD or identifier in COLLABORATOR_ADDRESSES:
+        return  # last_thread.json is only for the user's own threads, shared with morning_brief
     tmp = f"{LAST_THREAD_FILE}.{os.getpid()}.tmp"
     try:
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -75,10 +106,10 @@ def set_reply_target(identifier):
 
 def reply_target():
     """(chat_identifier, why) that the next send will use."""
+    if _current_target:
+        return _current_target, 'chat of the last message this process handled'
     if not REPLY_TO_SOURCE_THREAD:
         return REPLY_ADDRESS, 'reply-to-source-thread is off'
-    if _current_target:
-        return _current_target, 'thread of the last message this process handled'
     try:
         with open(LAST_THREAD_FILE, encoding='utf-8') as f:
             identifier = json.load(f).get('chat_identifier')
@@ -87,6 +118,67 @@ def reply_target():
     except (OSError, ValueError, AttributeError):
         pass
     return REPLY_ADDRESS, 'default (no message received yet)'
+
+
+# ---- One session per project folder -----------------------------------------
+# The user and the collaborator may each run a Claude Code session, but never in the
+# same folder at once (two sessions editing one tree would trample each other). The
+# bridge claims its project with an exclusive lock file; a lock whose process is gone
+# is stale and is taken over. The agent only READS it (project_holder) to say no early.
+def _project_lock_path(project):
+    digest = hashlib.sha1(os.path.realpath(project).encode()).hexdigest()[:16]
+    return f'/tmp/claude_project_{digest}.lock'
+
+
+def _read_project_lock(path):
+    """(pid, person) if `path` is a lock held by a live process, else None."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            held = json.load(f)
+        os.kill(int(held['pid']), 0)
+        return int(held['pid']), held.get('person', OWNER)
+    except PermissionError:
+        return int(held['pid']), held.get('person', OWNER)  # alive, just not ours
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def project_holder(project):
+    """(pid, person) of the live session using `project`, or None."""
+    return _read_project_lock(_project_lock_path(project))
+
+
+def claim_project(project, person):
+    """Take `project` for this process. None on success, else (pid, person) of the holder."""
+    path = _project_lock_path(project)
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            holder = _read_project_lock(path)
+            if holder and holder[0] != os.getpid():
+                return holder
+            try:
+                os.remove(path)  # stale (its process is gone) or ours: retake it
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid(), 'person': person, 'project': os.path.realpath(project)}, f)
+        return None
+    return _read_project_lock(path) or (0, OWNER)
+
+
+def release_project(project):
+    path = _project_lock_path(project)
+    held = _read_project_lock(path)
+    if held and held[0] == os.getpid():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 MAX_MESSAGE_CHARS = 1500   # per iMessage, including the "Part i/n: " label
 CHUNK_DELAY = 1.0          # seconds between parts so they arrive in order
 
