@@ -601,6 +601,8 @@ class Bridge:
                 self.finish_turn(event)
                 follow = self.wait_reply(FOLLOWUP_TIMEOUT)
                 if follow is None:
+                    self.notify("Session timed out from inactivity.")
+                    self.update_memory()
                     return self.notify("Session ended.")
                 if follow.upper() in END_WORDS:
                     self.update_memory()
