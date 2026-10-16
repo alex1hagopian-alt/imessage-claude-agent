@@ -294,13 +294,20 @@ def _send_one(text, identifier=None, why='explicit'):
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(text)
+        # A collaborator who has never texted the agent has no usable chat yet, and
+        # "send to chat id" then silently does nothing. Sending to the iMessage
+        # participant creates the chat (and reuses it afterwards).
+        if identifier in COLLABORATOR_ADDRESSES:
+            target = f'participant "{identifier}" of (1st account whose service type = iMessage)'
+        else:
+            target = f'chat id "{guid}"'
         script = f'''set replyFile to open for access POSIX file "{path}"
 set replyText to read replyFile as «class utf8»
 close access replyFile
 tell application "Messages"
-send replyText to chat id "{guid}"
+send replyText to {target}
 end tell'''
-        recipient = re.search(r'chat id "([^"]*)"', script).group(1)
+        recipient = guid
         _debug(f"sending to: {recipient} | routing={why} | pid={os.getpid()} "
                f"proc={os.path.basename(sys.argv[0])} text={text[:60]!r}")
         result = subprocess.run(['osascript', '-e', script],
