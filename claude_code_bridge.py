@@ -83,6 +83,20 @@ HARMLESS_TOOLS = ('WebFetch', 'WebSearch', 'TodoWrite', 'Task', 'Agent', 'BashOu
                   'KillShell', 'ExitPlanMode', 'NotebookRead')
 
 
+SCRATCH_DIRS = ('/tmp/', '/private/tmp/')  # throwaway files: writes here need no approval
+SOFT_RISKY = ('pip install', 'npm install')  # routine in a project; everything else risky still asks
+
+
+def _still_risky(command):
+    """risky_pattern, but pip/npm installs alone don't count (it returns the
+    first match, so strip installs first to still catch e.g. an install plus .env)."""
+    n = im._normalize_command(command)
+    for name, regex in im._RISKY_REGEXES:
+        if name in SOFT_RISKY:
+            n = regex.sub(' ', n)
+    return im.risky_pattern(n)
+
+
 def auto_decision(tool, tool_input, project_dir):
     """('allow', '') / ('deny', reason) / (None, '') = ask the user."""
     if tool == 'Bash':
@@ -91,7 +105,7 @@ def auto_decision(tool, tool_input, project_dir):
         if pattern:
             im.log_blocked(command, pattern, 'claude code session')
             return 'deny', f"Blocked by the safety rules (matches '{pattern}'). Use a safer approach."
-        return (None, '') if im.risky_pattern(command) else ('allow', '')
+        return (None, '') if _still_risky(command) else ('allow', '')
     if tool in FILE_TOOLS or tool in READ_TOOLS:
         raw = (tool_input.get('file_path') or tool_input.get('notebook_path')
                or tool_input.get('path') or '')
@@ -100,7 +114,8 @@ def auto_decision(tool, tool_input, project_dir):
         path = os.path.realpath(os.path.join(project_dir, os.path.expanduser(raw)))
         if SENSITIVE_PATH_RE.search(path):
             return None, ''
-        inside = path == project_dir or path.startswith(project_dir + os.sep)
+        inside = (path == project_dir or path.startswith(project_dir + os.sep)
+                  or path.startswith(SCRATCH_DIRS))
         if tool in FILE_TOOLS:
             return ('allow', '') if inside else (None, '')
         return 'allow', ''
