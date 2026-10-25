@@ -10,10 +10,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import base64
 import time
 
 import config
-import imessage_agent as im
 
 INBOX_DIR = '.imessage-inbox'
 MAX_AGE_HOURS = 24  # inbox files older than this are deleted
@@ -31,9 +31,14 @@ def _bin(name):
     return shutil.which(name) or os.path.join('/opt/homebrew/bin', name)
 
 
-def lookup(rowid):
-    """Attachments of one message: [{'path', 'name', 'mime', 'expected'}], oldest first."""
-    db = im.connect_db()
+def lookup(rowid, connect=None):
+    """Attachments of one message: [{'path', 'name', 'mime', 'expected'}], oldest first.
+    `connect` opens chat.db; it defaults to imessage_agent.connect_db (imported lazily, because
+    the agent itself runs as __main__ and must pass its own function instead)."""
+    if connect is None:
+        import imessage_agent
+        connect = imessage_agent.connect_db
+    db = connect()
     try:
         rows = db.execute('''
             SELECT a.filename, a.transfer_name, a.mime_type, a.total_bytes
@@ -169,3 +174,57 @@ def prepare(rowid, atts, project_dir):
     block = ('[The user attached the following from their phone; files are saved in the '
              f'project folder under {INBOX_DIR}/]\n' + '\n'.join(lines))
     return block, notes
+
+
+# ---- Group chats ----------------------------------------------------------------
+# In a group the model sees the chat as text, so voice notes become transcripts and photos are
+# passed as image blocks. Nothing is copied into a project folder.
+MAX_GROUP_IMAGE_BYTES = 20 * 1024 * 1024
+GROUP_IMAGE_PX = 1568
+_transcript_cache = {}   # file path -> transcript text, or None if it could not be transcribed
+
+
+def _jpeg_block(path):
+    """Image content block for the Claude API (any common image type, shrunk to JPEG), or None."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, 'photo.jpg')
+        done = subprocess.run(['/usr/bin/sips', '-s', 'format', 'jpeg', '-Z', str(GROUP_IMAGE_PX),
+                               path, '--out', out], capture_output=True)
+        if done.returncode != 0 or not os.path.exists(out):
+            return None
+        with open(out, 'rb') as f:
+            data = base64.b64encode(f.read()).decode()
+    return {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': data}}
+
+
+def describe_for_group(rowid, connect=None, want_images=True):
+    """What one group message's attachments say: (text_parts, image_blocks, pending).
+    text_parts look like '[voice message: "..."]' or '[photo]'; pending is True while a file is
+    still downloading (the caller should look again on the next poll)."""
+    parts, images, pending = [], [], False
+    for att in lookup(rowid, connect):
+        label = att['name'] or os.path.basename(att['path']) or 'attachment'
+        if not is_ready(att):
+            pending = True
+            continue
+        what = kind(att)
+        if os.path.getsize(att['path']) > MAX_GROUP_IMAGE_BYTES:
+            parts.append(f'[{what} too large to read]')
+        elif what == 'image':
+            block = _jpeg_block(att['path']) if want_images else None
+            if block:
+                images.append(block)
+                parts.append('[photo]')
+            else:
+                parts.append('[photo that could not be opened]' if want_images else '[photo]')
+        elif what == 'audio':
+            path = att['path']
+            if path not in _transcript_cache:
+                _transcript_cache[path] = transcribe(path)[0]
+            text = _transcript_cache[path]
+            parts.append(f'[voice message: "{text}"]' if text else '[voice message that could not be transcribed]')
+        elif what == 'video':
+            parts.append('[video, which you cannot watch]')
+        else:
+            parts.append(f'[file: {label}, which you cannot open]')
+    return parts, images, pending

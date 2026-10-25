@@ -41,6 +41,9 @@ EXTRA_USER_ADDRESSES = _csv('EXTRA_USER_ADDRESSES')
 # sessions, the morning brief. Unlike EXTRA_USER_ADDRESSES (more addresses of YOU, all
 # answered in your chat), their replies go to their OWN chat. Blank = no collaborator.
 COLLABORATOR_PHONE = _get('COLLABORATOR_PHONE')
+# First names used to label who said what when the agent is in a group chat.
+OWNER_NAME = _get('OWNER_NAME') or 'Owner'
+COLLABORATOR_NAME = _get('COLLABORATOR_NAME') or 'Collaborator'
 PROJECTS_DIR = os.path.expanduser(_get('PROJECTS_DIR') or '~/projects')
 CHAT_DB = os.path.expanduser(_get('CHAT_DB') or '~/Library/Messages/chat.db')
 LAUNCHD_LABEL = _get('LAUNCHD_LABEL') or 'com.example.imessageagent'

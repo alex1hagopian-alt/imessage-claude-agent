@@ -73,13 +73,28 @@ LAST_THREAD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'las
 _current_target = None
 
 
+# Group chats the agent has verified (every member is the owner or collaborator), by
+# chat_identifier ("chat123...") -> chat guid. Filled in by the agent; only these groups
+# can be sent to.
+TRUSTED_GROUPS = {}
+
+
+def is_group(identifier):
+    return bool(identifier) and identifier.startswith('chat')
+
+
 def chat_guid(identifier):
+    if identifier in TRUSTED_GROUPS:
+        return TRUSTED_GROUPS[identifier]
     return f'iMessage;-;{identifier}'  # always the iMessage chat, never the SMS one
 
 
 def reply_address_for(identifier):
     """The chat a reply to a message from `identifier` goes to. The collaborator's
-    always goes to their own chat; the user's follows REPLY_TO_SOURCE_THREAD."""
+    always goes to their own chat; the user's follows REPLY_TO_SOURCE_THREAD; a verified
+    group's goes back to the group."""
+    if identifier in TRUSTED_GROUPS:
+        return identifier
     if identifier in COLLABORATOR_ADDRESSES:
         return identifier
     if REPLY_TO_SOURCE_THREAD and identifier in USER_ADDRESSES:
@@ -90,10 +105,10 @@ def reply_address_for(identifier):
 def set_reply_target(identifier):
     """Record who just texted (from `identifier`); replies go back to their chat."""
     global _current_target
-    if identifier not in WATCH_IDENTIFIERS:
+    if identifier not in WATCH_IDENTIFIERS and identifier not in TRUSTED_GROUPS:
         return
     _current_target = reply_address_for(identifier)
-    if not REPLY_TO_SOURCE_THREAD or identifier in COLLABORATOR_ADDRESSES:
+    if not REPLY_TO_SOURCE_THREAD or identifier in COLLABORATOR_ADDRESSES or identifier in TRUSTED_GROUPS:
         return  # last_thread.json is only for the user's own threads, shared with morning_brief
     tmp = f"{LAST_THREAD_FILE}.{os.getpid()}.tmp"
     try:
@@ -102,6 +117,16 @@ def set_reply_target(identifier):
         os.replace(tmp, LAST_THREAD_FILE)  # atomic: other processes never read half a file
     except OSError:
         pass
+
+
+def restore_reply_target(target):
+    """Put back a target saved from reply_target()[0] (None = nothing recorded yet)."""
+    global _current_target
+    _current_target = target
+
+
+def current_reply_target():
+    return _current_target
 
 
 def reply_target():
@@ -330,10 +355,16 @@ end tell'''
 SEND_HOOKS = []
 
 
-def send_imessage(text, hooks=True):
-    """Text `text` to the user, splitting and labelling it if it is long."""
+def send_imessage(text, hooks=True, identifier=None):
+    """Text `text` to the user, splitting and labelling it if it is long. `identifier`
+    sends to one specific verified group chat without moving the normal reply target."""
     chunks = split_message(text)
-    identifier, why = reply_target()  # decided once, so all parts go to the same thread
+    if identifier is not None:
+        if identifier not in TRUSTED_GROUPS:
+            raise ValueError(f"not a verified group chat: {identifier}")
+        why = 'verified group chat'
+    else:
+        identifier, why = reply_target()  # decided once, so all parts go to the same thread
     for i, chunk in enumerate(chunks):
         if i:
             time.sleep(CHUNK_DELAY)

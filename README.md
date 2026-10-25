@@ -92,6 +92,12 @@ Set `COLLABORATOR_PHONE=+1...` in `.env` (remove the line to turn it off) and re
 - You can each run one session at a time, in different projects. Two sessions can't use the same folder: the second person gets "The other user is already running Claude Code in <project>". `status` also tells you if the other user has a session.
 - Everything is shared on the Mac: `list projects`, `memory <project>`, the command blocklist, and the kill switch. A collaborator can propose terminal commands (with your confirm tiers) and read project memory, so only add someone you trust. `restart agent` and `press enter|space|escape` are owner-only.
 
+### Group chats
+
+Create a group on your phone with the agent's Apple ID and your collaborator. The agent joins **only groups whose every member is you or the collaborator** (a stranger added later silences it) and only answers those two. In a group it is a chat-only assistant that knows two people are talking: it always replies when someone says "agent", and may jump in on its own when it can clearly help (otherwise it stays silent; unprompted replies are rate-limited to one per minute). It reads the last 20 messages of the group from Messages, so it has context even after a restart. The exact text commands work in a group too: `start claude <project>`, `stop claude`, `list projects`, `memory <project>` (and `agent, status`); `restart agent` and `press ...` stay owner-only. A group can run its own Claude Code session (separate from each person's private one, never in a project another session is using). Because two people are chatting, a running session only reads messages that say "agent" ("agent, add a login page") and bare menu answers (`1`, `2`, `yes`, `no`, `stop claude`); either person can answer a permission prompt. Free-form terminal commands are not proposed in groups, and the system documentation (with your personal details) is not shown to the model there.
+
+Each group also has a **memory**: every dozen messages, or five quiet minutes, the agent folds the important parts of the conversation (decisions, plans, deadlines, who owns what, what Claude Code sessions did) into a notes file `group_memory/<chat>.md` (git-ignored), and shows those notes to the model on every reply, so context reaches back well beyond the last 20 messages and survives restarts. Say "agent, remember ..." to save something right away; `group memory` shows the notes and `clear group memory` deletes them. Set `OWNER_NAME` / `COLLABORATOR_NAME` in `.env` so the transcript has real names.
+
 ## iMessage commands
 
 Text the agent's address from your iPhone.
@@ -152,7 +158,7 @@ Debugging: `agent.log` and `agent_error.log` (the agent), `bridge.log` (Claude C
 ## Limitations
 
 - macOS only; it depends on the Messages database layout and AppleScript, which Apple can change.
-- Messages in iMessage groups are not supported.
+- In iMessage groups the agent chats, runs the exact commands and Claude Code sessions, but doesn't propose free-form terminal commands.
 - If the API key runs out of credit, chat and Claude Code sessions fail (the agent tells you why); local commands like `status` and `restart agent` keep working.
 - Chat is billed to your API key: each message sends the project documentation (about 8k tokens, cached for 5 minutes) plus the last 10 messages.
 - Anyone who controls your iPhone or your Apple ID can control this agent. Treat access to the agent's conversation like access to a terminal on the Mac.

@@ -178,6 +178,13 @@ def describe_event(event):
     return None
 
 
+# In a group session only messages like these are for the session: "agent, ..." or a bare answer
+# to a permission menu. Everything else is the two people talking to each other.
+GROUP_ADDRESS_RE = re.compile(r'\bagent\b', re.IGNORECASE)
+GROUP_PREFIX_RE = re.compile(r'^\s*agent\b[\s,:;.!-]*', re.IGNORECASE)
+GROUP_ANSWER_RE = re.compile(r'^\s*(?:[1-9]|yes|no|y|n|stop claude)\s*[.!]?\s*$', re.IGNORECASE)
+
+
 def is_stop(text):
     # "stop claude" is also an imessage_agent.py command; treat it as STOP here
     return text.strip().upper() == 'STOP' or im.STOP_RE.match(text) is not None
@@ -221,9 +228,12 @@ def describe_suggestion(suggestion):
 
 class Bridge:
     def __init__(self, project_dir, permission_mode='default', model=DEFAULT_MODEL,
-                 send=None, claude_bin='claude', owner=OWNER, trusted=True):
+                 send=None, claude_bin='claude', owner=OWNER, trusted=True, group=None):
         self.trusted = trusted  # auto-approve routine requests (see auto_decision)
         self.owner = owner  # whose session this is: only their texts count, replies go to their chat
+        # A verified group chat (chat_identifier) this session belongs to: then the group's messages
+        # that address "agent" (plus bare 1/2/yes/no answers) count, from either person in it
+        self.group = group
         self.project_dir = os.path.abspath(project_dir)
         self.name = os.path.basename(self.project_dir)
         self.permission_mode = permission_mode
@@ -280,11 +290,19 @@ class Bridge:
     def poll_inbox(self):
         """New texts from the user since the last call, oldest first."""
         texts = []
-        for row in im.get_messages_after(self.cursor):
+        if self.group:
+            rows = [r for r in im.get_group_messages_after(self.cursor) if r[5] == self.group]
+        else:
+            rows = im.get_messages_after(self.cursor)
+        for row in rows:
             rowid = row[0]
             msg = im.parse_message(row)
             chat = row[5] if len(row) > 5 else None
-            atts = attachments.lookup(rowid) if person_for(chat) == self.owner else []
+            if self.group:
+                # only look at (and copy) attachments of messages meant for the agent
+                atts = self._group_attachments(row, msg)
+            else:
+                atts = attachments.lookup(rowid) if person_for(chat) == self.owner else []
             # an attachment-only message has just the object-replacement character
             typed = (msg or '').replace('\ufffc', '').strip()
             if atts and not all(attachments.is_ready(a) for a in atts):
@@ -302,12 +320,19 @@ class Bridge:
                 continue
             self.empty_polls.pop(rowid, None)
             self.cursor = rowid
-            if person_for(chat) != self.owner:
+            if self.group:
+                # two people chat here: only a message to "agent" (or a bare menu answer) is for us
+                msg = self._group_message(typed, atts)
+                if msg is None:
+                    log(f"IGNORED rowid {rowid} (group chat, not addressed to agent): {one_line(typed, 120)}")
+                    continue
+            elif person_for(chat) != self.owner:
                 # The other person's texts are the agent's business; they must never
                 # answer this session's permission prompts or give it tasks.
                 log(f"IGNORED rowid {rowid} (from the other user, {chat})")
                 continue
-            msg = typed
+            else:
+                msg = typed
             reason = im.own_message_reason(msg, row[4]) if msg else None
             if reason is None and msg and im.is_agent_command(msg):
                 reason = 'command for the agent'
@@ -332,6 +357,27 @@ class Bridge:
                 msg = (msg + '\n\n' + block).strip()
             texts.append(msg)
         return texts
+
+    def _group_attachments(self, row, msg):
+        """Attachments of a group message, but only if it is addressed to the agent, by its caption
+        or by what a voice note says (the transcript is cached, nothing is copied until then)."""
+        if '\ufffc' not in (msg or ''):
+            return []
+        try:
+            parts, _, _ = attachments.describe_for_group(row[0], im.connect_db, want_images=False)
+        except Exception as e:
+            log(f"group attachment check failed for rowid {row[0]}: {e!r}")
+            return []
+        spoken = ((msg or '').replace('\ufffc', '') + ' ' + ' '.join(parts))
+        return attachments.lookup(row[0]) if GROUP_ADDRESS_RE.search(spoken) else []
+
+    def _group_message(self, typed, atts):
+        """The text to give this session from a group message, or None if it isn't for us."""
+        if GROUP_ANSWER_RE.match(typed):
+            return typed
+        if GROUP_ADDRESS_RE.search(typed) or atts:
+            return GROUP_PREFIX_RE.sub('', typed, count=1).strip() or typed
+        return None
 
     def wait_reply(self, timeout, nudge=None):
         """Block until the user sends any text. Returns None on timeout.
@@ -684,10 +730,20 @@ def main():
                         help=f'Claude model for the session (default: {DEFAULT_MODEL})')
     parser.add_argument('--owner', default=OWNER, choices=list(imessage_common.PEOPLE),
                         help='whose session this is: only their texts are read, replies go to their chat')
+    parser.add_argument('--group', help='chat_identifier of a verified group chat this session belongs to '
+                                        '(the agent passes it; replaces --owner)')
+    parser.add_argument('--group-guid', help='that group chat\'s guid')
     args = parser.parse_args()
-    # Pin where this process texts BEFORE anything is sent: the owner's chat, whatever
-    # a stale last_thread.json says (it may belong to the other person)
-    set_reply_target(imessage_common.person_addresses(args.owner)[0])
+    if args.group:
+        if not args.group_guid:
+            sys.exit("--group needs --group-guid")
+        args.owner = im.GROUP_PREFIX + args.group
+        imessage_common.TRUSTED_GROUPS[args.group] = args.group_guid   # the agent verified its members
+        set_reply_target(args.group)
+    else:
+        # Pin where this process texts BEFORE anything is sent: the owner's chat, whatever
+        # a stale last_thread.json says (it may belong to the other person)
+        set_reply_target(imessage_common.person_addresses(args.owner)[0])
     startup_debug(args.owner)
 
     if not os.path.isdir(args.project_dir):
@@ -719,7 +775,7 @@ def main():
     signal.signal(signal.SIGTERM, on_sigterm)
 
     bridge = Bridge(args.project_dir, args.permission_mode, args.model, owner=args.owner,
-                    trusted=not args.ask_all)
+                    trusted=not args.ask_all, group=args.group)
     bridge.state_file = state_file
     bridge.write_state()
     log(f"bridge started (pid {os.getpid()}, owner {args.owner}) for {bridge.project_dir}, replying in {reply_target()}"

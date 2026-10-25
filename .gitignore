@@ -27,3 +27,6 @@ CLAUDE.md
 
 # Photos and voice notes copied in from iMessage
 .imessage-inbox/
+
+# Per-group conversation notes (private chat content)
+group_memory/
