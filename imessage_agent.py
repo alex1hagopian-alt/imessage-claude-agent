@@ -90,6 +90,9 @@ DISABLED_FLAG = os.path.join(PROJECT_DIR, 'AGENT_DISABLED')
 START_RE = re.compile(r'^\s*start\s+claude(?:\s+(.+?))?\s*$', re.IGNORECASE)
 STOP_RE = re.compile(r'^\s*stop\s+claude\s*$', re.IGNORECASE)
 LIST_RE = re.compile(r'^\s*list\s+projects\s*$', re.IGNORECASE)
+# "research trading-bot" or "research trading-bot: options data APIs"
+RESEARCH_TOGGLE_RE = re.compile(r'^\s*research\s+(on|off|status)\s*$', re.IGNORECASE)
+RESEARCH_RE = re.compile(r'^\s*research\s+([\w-]+)(?:\s*[:\-]\s*(.+?))?\s*$', re.IGNORECASE)
 # "status" / "update" requests. Deliberately narrow: only short messages, "update"
 # only as a noun ("an update", "status update"), never "git status" and never
 # something that opens like an instruction, because real tasks such as
@@ -1082,6 +1085,36 @@ def resolve_project(arg):
     return os.path.join(PROJECTS_DIR, norm), True, None
 
 
+def research_toggle(word):
+    import research_agent
+    word = word.lower()
+    if word == 'status':
+        ran = research_agent.last_runs()
+        recent = ', '.join(f"{p} ({d})" for p, d in sorted(ran.items(), key=lambda kv: kv[1], reverse=True)[:5])
+        send_imessage(f"Auto research is {'ON' if research_agent.is_enabled() else 'OFF'}. "
+                      f"Recent runs: {recent or 'none yet'}.")
+        return
+    research_agent.set_enabled(word == 'on')
+    send_imessage("Auto research is ON: the first task of each Claude Code session (once per project per day) "
+                  "starts a research run, and the digest is texted to you." if word == 'on' else
+                  "Auto research is OFF. Claude Code sessions won't start research. "
+                  "\"research <project>\" still works when you ask.")
+
+
+def start_research(project, topic):
+    """Run research_agent.py detached (it texts the digest itself) so this loop is not blocked."""
+    name = normalize_project_name(project)
+    if name not in project_names():
+        send_imessage(f"I don't have a project called {name}. Text \"list projects\" to see them.")
+        return
+    cmd = [sys.executable, os.path.join(PROJECT_DIR, 'research_agent.py'), name, '--send']
+    if topic:
+        cmd += ['--topic', topic]
+    with open(os.path.join(PROJECT_DIR, 'research.log'), 'a') as log:
+        subprocess.Popen(cmd, cwd=PROJECT_DIR, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    send_imessage(f"Researching {name}" + (f" ({topic})" if topic else "") + " — takes about a minute.")
+
+
 def list_projects():
     names = []
     if os.path.isdir(PROJECTS_DIR):
@@ -1399,6 +1432,14 @@ def handle_bridge_command(msg, allow_pending=True):
         return True
     if LIST_RE.match(msg):
         list_projects()
+        return True
+    match = RESEARCH_TOGGLE_RE.match(msg)
+    if match:
+        research_toggle(match.group(1))
+        return True
+    match = RESEARCH_RE.match(msg)
+    if match:
+        start_research(match.group(1), match.group(2))
         return True
     match = CLEAR_MEMORY_RE.match(msg)
     if match:

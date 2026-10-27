@@ -30,3 +30,8 @@ CLAUDE.md
 
 # Per-group conversation notes (private chat content)
 group_memory/
+
+# Research agent: profiles and digests describe private projects
+research_profiles/
+research_inbox/
+research_state.json

@@ -28,6 +28,7 @@ import time
 import attachments
 import imessage_agent as im
 import imessage_common
+import research_agent
 from imessage_common import OWNER, person_for, reply_target, send_imessage, set_reply_target
 
 # Always passed to claude explicitly, so sessions don't depend on whatever model
@@ -61,6 +62,12 @@ COMMAND_EXPLAIN_PROMPT = ("Every time you call the Bash tool, always set its des
                           "to one or two short plain-English sentences explaining what the "
                           "command does, written for a complete beginner. Do this for every "
                           "command, even simple ones like ls or pip install.")
+RESEARCH_PROMPT = ("A background research agent keeps short summaries of the user's OTHER projects in {profiles}/ "
+                   "(and its latest digest for this project in {inbox}/{name}.md). When a task could reuse something the "
+                   "user already set up elsewhere (an API account, a library, a script), read those files instead of "
+                   "asking the user to point you at them. Skip them for small, simple changes. When a task arrives with "
+                   "a research digest attached, plan with it: it was gathered for this exact task.")
+RESEARCH_TIMEOUT = 240  # seconds the bridge will hold a task for research before sending it anyway
 NO_EXPLANATION = "(No plain-English explanation was provided for this command.)"
 
 # A result saying one of these means the turn accomplished nothing worth remembering.
@@ -406,7 +413,9 @@ class Bridge:
                '--permission-mode', self.permission_mode,
                '--permission-prompt-tool', 'stdio',
                '--append-system-prompt',
-               BRIDGE_SYSTEM_PROMPT + ' ' + COMMAND_EXPLAIN_PROMPT]
+               BRIDGE_SYSTEM_PROMPT + ' ' + COMMAND_EXPLAIN_PROMPT + ' ' + RESEARCH_PROMPT.format(
+                   inbox=research_agent.INBOX_DIR, profiles=research_agent.PROFILE_DIR,
+                   name=os.path.basename(os.path.normpath(self.project_dir)))]
         if self.model:
             cmd += ['--model', self.model]
         self.proc = subprocess.Popen(
@@ -450,6 +459,50 @@ class Bridge:
         self.ack_pending = self.ack_pending or count_as_work
         self.write({'type': 'user',
                     'message': {'role': 'user', 'content': text}})
+
+    def submit_task(self, task):
+        """send_task, but first (auto mode) research the task if it is worth it, holding it until the digest is ready."""
+        digest = self.research_for(task)
+        if digest:
+            task = (f"{task}\n\n---\nResearch digest (gathered just now for this task by a background research "
+                    f"agent; treat it as suggestions to verify, and mention any tool you adopt):\n{digest}")
+        self.send_task(task)
+
+    def research_for(self, task):
+        plan = research_agent.plan(self.project_dir, task)
+        if plan['action'] == 'skip':
+            return None
+        if plan['action'] == 'reuse':
+            self.notify(f"Reusing recent research on \"{plan['topic']}\".")
+            return plan['digest']
+        self.notify(f"Researching \"{plan['topic']}\" before starting (about 1-2 minutes). "
+                    "Reply SKIP to start right away.")
+        box = {}
+
+        def work():
+            try:
+                box['digest'] = research_agent.research(os.path.basename(os.path.normpath(self.project_dir)),
+                                                        plan['topic'])
+            except BaseException as e:  # SystemExit included: research must never take the session down
+                log(f"research failed: {e!r}")
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        deadline = time.time() + RESEARCH_TIMEOUT
+        while thread.is_alive() and time.time() < deadline:
+            for text in self.poll_inbox():
+                if is_stop(text):
+                    raise StopSession()
+                if text.strip().upper() == 'SKIP':
+                    self.notify("Skipping research.")
+                    return None
+                self.notify("Still researching first. Reply SKIP to start now, or STOP to cancel.")
+            thread.join(timeout=im.POLL_SECONDS)
+        digest = box.get('digest')
+        if not digest:
+            self.notify("Research didn't finish or failed; starting without it.")
+            return None
+        self.notify(digest)
+        return digest
 
     def answer_permission(self, request_id, allow, tool_input, reason='',
                           permissions=None):
@@ -634,7 +687,7 @@ class Bridge:
             task = first_task or self.prompt_for_task()
             if task is None:
                 return self.notify("No task received — ending session.")
-            self.send_task(task)
+            self.submit_task(task)
 
         while True:
             try:
@@ -656,7 +709,7 @@ class Bridge:
                     task = first_task or self.prompt_for_task()
                     if task is None:
                         return self.notify("No task received — ending session.")
-                    self.send_task(task)
+                    self.submit_task(task)
                     continue
                 self.preamble_pending = False
                 self.finish_turn(event)
@@ -668,7 +721,7 @@ class Bridge:
                 if follow.upper() in END_WORDS:
                     self.update_memory()
                     return self.notify("Session ended.")
-                self.send_task(follow)
+                self.submit_task(follow)
 
     def check_stop_while_busy(self):
         for text in self.poll_inbox():
