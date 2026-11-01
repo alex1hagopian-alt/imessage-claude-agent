@@ -118,10 +118,11 @@ def auto_decision(tool, tool_input, project_dir):
                or tool_input.get('path') or '')
         if not raw:
             return ('allow', '') if tool in READ_TOOLS else (None, '')
-        path = os.path.realpath(os.path.join(project_dir, os.path.expanduser(raw)))
+        real_project = os.path.realpath(project_dir)  # resolve symlinks on both sides
+        path = os.path.realpath(os.path.join(real_project, os.path.expanduser(raw)))
         if SENSITIVE_PATH_RE.search(path):
             return None, ''
-        inside = (path == project_dir or path.startswith(project_dir + os.sep)
+        inside = (path == real_project or path.startswith(real_project + os.sep)
                   or path.startswith(SCRATCH_DIRS))
         if tool in FILE_TOOLS:
             return ('allow', '') if inside else (None, '')
