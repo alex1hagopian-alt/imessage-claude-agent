@@ -155,7 +155,34 @@ def state():
     return STATES.setdefault(CURRENT_PERSON, PersonState())
 # SENT_TEXTS (what this process has sent, for echo filtering) lives in imessage_common.
 
-ASSISTANT_MODEL = "claude-sonnet-4-6"
+ASSISTANT_MODEL = "claude-sonnet-5-5"  # default / fallback (also used by group chats and memory updates)
+ROUTER_MODEL = "claude-haiku-5-5"      # picks a model per message (1:1 assistant only)
+MODEL_TIERS = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5", "opus": "claude-opus-5-5"}
+ROUTER_PROMPT = """You choose which Claude model should answer a text message sent to a personal assistant on a Mac. Lean toward the cheaper model.
+- haiku: greetings, thanks, yes/no, simple questions, short factual or how-do-I-use-this-system answers, running one simple terminal command (ls, status checks, opening something).
+- sonnet: the normal choice for anything needing real thought: explanations, planning, summarizing project notes, multi-step terminal work, writing, moderate debugging.
+- opus: only when the stakes or difficulty are high: important or hard-to-reverse decisions, complex architecture or strategy, tricky debugging or analysis, long careful writing, anything the user stresses as important.
+If unsure between two, pick the cheaper one, except when a mistake would be costly.
+Reply with exactly one word: haiku, sonnet or opus."""
+
+
+def pick_model(user_message):
+    """Cheap haiku call that routes this message to haiku/sonnet/opus. Any failure -> the default."""
+    try:
+        recent = list(state().conversation)[-2:]
+        context = "\n".join(f"{m['role']}: {str(m['content'])[:300]}" for m in recent)
+        prompt = (f"Recent conversation:\n{context or '(none)'}\n\nNew message:\n{user_message[:1500]}")
+        response = client.messages.create(
+            model=ROUTER_MODEL, max_tokens=2000, system=ROUTER_PROMPT,
+            messages=[{"role": "user", "content": prompt}])
+        answer = "".join(b.text for b in response.content if b.type == "text").strip().lower()
+        for tier in ("opus", "haiku", "sonnet"):
+            if tier in answer:
+                print(f"Model router: {tier}")
+                return MODEL_TIERS[tier]
+    except Exception as e:  # never let routing break a reply
+        print(f"Model router failed ({e}); using {ASSISTANT_MODEL}")
+    return ASSISTANT_MODEL
 MAX_REPLY_TOKENS = 1024
 
 SYSTEM_PROMPT = """You are a personal assistant running on the user's Mac Mini, and the user talks to you by iMessage. You can have normal conversations, answer questions, brainstorm ideas, and explain how this system works. You can also take actions on the Mac by proposing terminal commands.
@@ -1498,10 +1525,11 @@ def process_command(user_message):
         # Anything else abandons the proposal, so a late "YES" can't run it
         me.pending_action = {}
 
+    model = pick_model(user_message)  # before history_messages() adds this message
     try:
         response = create_with_notes(
             history_messages(user_message),
-            model=ASSISTANT_MODEL,
+            model=model,
             max_tokens=MAX_REPLY_TOKENS,
             system=build_system(),
             tools=TOOLS + [NOTES_TOOL],
